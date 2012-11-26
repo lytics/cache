@@ -84,7 +84,7 @@ func (this *Cache) GetOrLoad(key string) (interface{}, error) {
 }
 
 // Atomically removes and returns all cache elements such that:
-//  - the element's timestamp is older than the given age
+//  - the element's timestamp is older than the max age
 //  - the element is one of the oldest and the cache is over its target size
 func (this *Cache) Expire() map[string]interface{} {
 	// TODO running this function with the global lock absolutely destroys throughput. (~8x)
