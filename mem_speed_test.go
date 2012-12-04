@@ -59,28 +59,29 @@ func BenchmarkMem_8pr_1strp_1gort_200maxsize_HourExpire(b *testing.B) {
 	doBenchmark(b.N, b, 8, 1, 1, int64(200), time.Hour, int64(900), 0)
 }
 
-// This isn't a proper golang "benchmark," it hard-codes the number of iterations and has
-// no meaningful concept of latency per operation.
-func TestCacheWarmup(t *testing.T) {
-	runBenchmark := func(count int) float64 {
-		beforeNanos := time.Now().UnixNano()
-		doBenchmark(count, nil, 8, 128, 128, int64(100000), time.Hour, int64(900000), 0)
-		duration := time.Now().UnixNano() - beforeNanos
-		throughput := float64(count) / float64(duration)
-		return throughput
-	}
+// // This isn't a proper golang "benchmark," it hard-codes the number of iterations and has
+// // no meaningful concept of latency per operation. So that's why it doesn't use go's builtin
+// // benchmark system.
+// func TestCacheWarmup(t *testing.T) {
+// 	runBenchmark := func(count int) float64 {
+// 		beforeNanos := time.Now().UnixNano()
+// 		doBenchmark(count, nil, 8, 128, 128, int64(100000), time.Hour, int64(900000), 0)
+// 		duration := time.Now().UnixNano() - beforeNanos
+// 		throughput := float64(count) / float64(duration)
+// 		return throughput
+// 	}
 
-	firstCount := 10000
-	firstThroughput := runBenchmark(firstCount)
-	fmt.Printf("%d ops throughput=%f\n", firstCount, firstThroughput)
+// 	firstCount := 10000
+// 	firstThroughput := runBenchmark(firstCount)
+// 	fmt.Printf("%d ops throughput=%f\n", firstCount, firstThroughput)
 
-	secondCount := firstCount * 5
-	secondThroughput := runBenchmark(secondCount)
-	fmt.Printf("%d ops throughput=%f\n", secondCount, secondThroughput)
+// 	secondCount := firstCount * 5
+// 	secondThroughput := runBenchmark(secondCount)
+// 	fmt.Printf("%d ops throughput=%f\n", secondCount, secondThroughput)
 
-	speedUp := secondThroughput / firstThroughput
-	fmt.Printf("Speedup: %f\n", speedUp)
-}
+// 	speedUp := secondThroughput / firstThroughput
+// 	fmt.Printf("Speedup: %f\n", speedUp)
+// }
 
 func doBenchmark(numOps int, b *testing.B, gomaxprocs int, numStripes int, numGoRoutines int,
 	maxSize int64, maxAge time.Duration, fakeDbMax int64, simLatency time.Duration) {
@@ -117,7 +118,7 @@ func doBenchmark(numOps int, b *testing.B, gomaxprocs int, numStripes int, numGo
 	initWg.Add(1)
 	finishedWg.Add(numGoRoutines)
 
-	cache := NewCache(numStripes, maxSize, maxAge, loader, sizer)
+	cache := NewCache(numStripes, loader, sizer)
 
 	for i := 0; i < numGoRoutines; i++ {
 		go func(numOpsForThread int, seed int) {
@@ -136,7 +137,7 @@ func doBenchmark(numOps int, b *testing.B, gomaxprocs int, numStripes int, numGo
 				r := zipf.Uint64()
 				// fmt.Printf("zipf: %d\t", r)
 				result, err := cache.GetOrLoad(strconv.FormatInt(int64(r), 10))
-				cache.Expire() // Enforce cache size and max age constraints
+				cache.Expire(maxSize, maxAge) // Enforce cache size and max age constraints
 				if err != nil {
 					panic("Cache lookup error")
 				}

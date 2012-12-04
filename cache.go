@@ -10,33 +10,36 @@ import (
 
 // A Cache is a concurrent in-memory data structure backed by a database. It internally uses
 // lock striping to try to achieve high throughput when used by many goroutines.
-// TODO: we might want to support Remove(k), Add(k, v), Combine(k, v, func(v,v))
 type Cache struct {
 	stripes    []*stripe
 	numStripes int
-	maxSize    int64
-	maxAge     int64
-	loader     CacheLoader
-	sizer      Sizer
-	cacheLock  *sync.RWMutex
+	// maxSize    int64
+	// maxAge     int64
+	loader    CacheLoader
+	sizer     Sizer
+	cacheLock *sync.RWMutex
 }
 
+// A function that can look up a key that's not already in the cache. If this function panics
+// or calls one of the cache functions, that's very bad and the result is undefined. Most
+// implementations of this function will do a database lookup.
+type CacheLoader func(key string) (interface{}, error)
+
+// A function that can estimate the size of a cache entry. This is used to enforce the max
+// size of the cache.
+type Sizer func(interface{}) int64
+
 // Make a new cache.
-//  - numStripes: how many partitions/locks this cache should have
-//  - maxSize: the size after which the cache should start evicting writes. The cache is likely
-//             to exceed this size; it's the caller's responsibility to periodically call
-//             Expire() to bring the cache size back down to the max.
+//  - numStripes: how many partitions/locks this cache should have. This number should be a
+//                factor of 256 for even stripe distribution.
 //  - loader: the caller provides this implementation to retrieve a cache entry from the
 //            backing database if it's not already in the cache.
 //  - sizer: the caller provides this implementation to calculate the size of a cache entry.
-func NewCache(numStripes int, maxSize int64, maxAge time.Duration, loader CacheLoader,
-	sizer Sizer) *Cache {
+func NewCache(numStripes int, loader CacheLoader, sizer Sizer) *Cache {
 
 	return &Cache{
 		stripes:    newStripes(numStripes),
 		numStripes: numStripes,
-		maxSize:    maxSize,
-		maxAge:     int64(maxAge),
 		loader:     loader,
 		sizer:      sizer,
 		cacheLock:  new(sync.RWMutex),
@@ -46,54 +49,125 @@ func NewCache(numStripes int, maxSize int64, maxAge time.Duration, loader CacheL
 // Look up the given key in the cache. If it's not in the cache, load it using the loader that
 // was passed to NewCache.
 func (this *Cache) GetOrLoad(key string) (interface{}, error) {
+	// A Get is actually the same thing as a Combine with nothing. The combiner just returns
+	// the loaded value, which will then be stored in the cache.
+	return this.Combine(key, nil, func(loaded interface{}, _ interface{}) (interface{}, error) {
+		return loaded, nil
+	})
+}
+
+// This can be used to modify an existing value held in the cache. You pass a function to be
+// executed while holding locks that guarantee exclusive access to that cache entry. The
+// arguments to the function are (1) the current cache value and (2) an arbitrary value to be
+// combined with it that the caller passes to Combine(). A combiner may return an error, which
+// will cause the Combine() function to have no effect.
+// If there is no value for the given key (the loader returned nil) then the combiner will
+// get a nil as its first parameter.
+// A Combiner can mutate its first argument in place, in which case it should also return that
+// value as its return value.
+type Combiner func(interface{}, interface{}) (interface{}, error)
+
+// Modify a cached value using the given combiner function, holding locks to guarantee
+// exclusive access. If no value is cached for the given key, the loader will first be invoked 
+// to load a value.
+// Returns the new value of the cache entry, or error if the combiner returned error.
+func (this *Cache) Combine(key string, newVal interface{}, combiner Combiner) (interface{}, error) {
 	this.cacheLock.RLock() // Mutual exclusion against threads computing cache expiration
 	defer this.cacheLock.RUnlock()
 
 	stripe := this.getStripe(key)
 
-	// Future note: if renewOnRead is false, then reads do not modify the cache. In that case 
-	// we could allow multiple concurrent readers on the same stripe by putting an RWMutex in 
-	// struct stripe instead of Mutex.	
 	stripe.lock.Lock() // Mutual exclusion against threads reading/writing the same stripe
 	defer stripe.lock.Unlock()
 
-	elem, isPresent := stripe.elemMap[key]
-	if isPresent {
-		keyValue := elem.Value.(*keyValue)
-		// fmt.Printf("Hit!\t")
-		return keyValue.v, nil
+	// Get the existing value from the to combine with (or nil if nonexistent)
+	var existingVal interface{}
+	elem, hasExisting := stripe.elemMap[key]
+	if hasExisting {
+		existingVal = elem.Value.(*keyValue).v
+	} else {
+		dbVal, err := this.loader(key)
+		if err != nil {
+			return nil, err
+		}
+		existingVal = dbVal
 	}
-	// fmt.Printf("Miss!\t")
 
-	// For performance, we could do this without holding the stripe lock? But we also
-	// want to prevent loading the same key multiple times concurrently to avoid slamming
-	// the backing database with load spikes. Maybe we need a separate lock table for loads.
-	v, err := this.loader(key)
+	combinedVal, err := combiner(existingVal, newVal)
 	if err != nil {
 		return nil, err
 	}
-	if v == nil {
-		return nil, nil // We do not cache negative responses.
+
+	// The combiner can return nil to cause the cache entry to be removed.
+	if combinedVal == nil {
+		if hasExisting {
+			delete(stripe.elemMap, key)
+			stripe.totalSize -= elem.Value.(*keyValue).size
+			stripe.lst.Remove(elem)
+		}
+	} else {
+		// The value returned from the combiner was not null.
+		newSize := this.sizer(combinedVal)
+
+		if hasExisting {
+			// Update preexisting entry.
+			keyValue := elem.Value.(*keyValue)
+
+			stripe.totalSize -= keyValue.size
+			stripe.totalSize += newSize
+
+			keyValue.v = combinedVal
+			keyValue.size = newSize
+		} else {
+			// The entry did not previously exist. Store it in the cache now.
+			keyValue := newKeyValue(key, combinedVal, time.Now().UnixNano(), newSize)
+			stripe.totalSize += newSize
+			newElem := stripe.lst.PushBack(keyValue)
+			stripe.elemMap[key] = newElem
+		}
 	}
-	size := this.sizer(v)
-	keyValue := newKeyValue(key, v, time.Now().UnixNano(), size)
-	newElem := stripe.lst.PushBack(keyValue)
-	stripe.totalSize += size
-	stripe.elemMap[key] = newElem
-	return v, err
+
+	return combinedVal, nil
 }
 
-// Atomically removes and returns all cache elements such that:
+// A function that is called when a cache entry is removed from the cache. You might use this to
+// flush to a database.
+type EvictHandler func(key string, entry interface{}) error
+
+// A shortcut for ExpireAndHandle(), but doesn't need an EvictHandler. Returns expired entries
+// a map from cacheKey->cacheVal.
+func (this *Cache) Expire(maxSize int64, maxAge time.Duration) map[string]interface{} {
+	m := make(map[string]interface{})
+
+	// This eviction hander will just add the evicted items to a map
+	evictHandler := func(key string, val interface{}) error {
+		m[key] = val
+		return nil
+	}
+
+	if err := this.ExpireAndHandle(maxSize, maxAge, evictHandler); err != nil {
+		panic(err) // there should never be an error because the EvictHandler will never have one
+	}
+
+	return m
+}
+
+// Removes all cache elements such that:
 //  - the element's timestamp is older than the max age
 //  - the element is one of the oldest and the cache is over its target size
-func (this *Cache) Expire() map[string]interface{} {
+// If the evict handler encounters an error, then the eviction will stop at that point, so the
+// cache size constraints may not be met until an Expire call succeeds.
+// The eviction handler holds a stripe lock while evicting (by design) so try to make it fast.
+func (this *Cache) ExpireAndHandle(maxSize int64, maxAge time.Duration,
+	evictHandler EvictHandler) error {
+
 	// TODO running this function with the global lock absolutely destroys throughput. (~8x)
 
 	this.cacheLock.Lock()
 	defer this.cacheLock.Unlock()
 
-	returnMap := make(map[string]interface{})
-	expireNanos := time.Now().UnixNano() - int64(this.maxAge)
+	// returnMap := make(map[string]interface{})
+	expireNanos := time.Now().UnixNano() - int64(maxAge)
 
 	// Now remove all elements older than their expiration time
 	for _, stripe := range this.stripes {
@@ -103,12 +177,11 @@ func (this *Cache) Expire() map[string]interface{} {
 			if keyValue.nanos >= expireNanos {
 				break // no more values to expire in this stripe
 			}
-			delete(stripe.elemMap, keyValue.k)
-			returnMap[keyValue.k] = keyValue.v
-			stripe.totalSize -= keyValue.size
-			elemToRemove := elem
+			elemToDelete := elem
 			elem = elem.Next()
-			stripe.lst.Remove(elemToRemove)
+			if _, err := stripe.remove(elemToDelete, evictHandler); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -119,7 +192,8 @@ func (this *Cache) Expire() map[string]interface{} {
 	}
 
 	// Now remove elements as necessary to enforce the size limit
-	for sizeAllStripes > this.maxSize {
+	for sizeAllStripes > maxSize {
+
 		// This could use a min-heap instead of a nested loop if it turns out to be too slow.
 		minStripeIdx := -1
 		oldestTimestamp := int64(-1)
@@ -142,15 +216,20 @@ func (this *Cache) Expire() map[string]interface{} {
 
 		stripeToTakeFrom := this.stripes[minStripeIdx]
 		elemToRemove := stripeToTakeFrom.lst.Front()
-		kvToRemove := elemToRemove.Value.(*keyValue)
-		stripeToTakeFrom.lst.Remove(elemToRemove)
-
-		returnMap[kvToRemove.k] = kvToRemove.v
-		stripeToTakeFrom.totalSize -= kvToRemove.size
-		sizeAllStripes -= kvToRemove.size
+		sizeRemoved, err := stripeToTakeFrom.remove(elemToRemove, evictHandler)
+		if err != nil {
+			return err
+		}
+		sizeAllStripes -= sizeRemoved
 	}
 
-	return returnMap
+	return nil
+}
+
+// Remove all entries from the cache, invoking the evictHandler for each one. See EvictHandler
+// and Combine for instructions on how evict handlers work.
+func (this *Cache) EvictAll(evictHandler EvictHandler) error {
+	return this.ExpireAndHandle(-1, -1, evictHandler)
 }
 
 // Returns the sum of all the sizes of all the cache entries plus the lengths of the cache keys.
@@ -169,21 +248,34 @@ func (this *Cache) Size() int64 {
 	return totalSize
 }
 
-// A function that can look up a key that's not already in the cache. If this function panics
-// or calls one of the cache functions, that's very bad and the result is undefined. Most
-// implementations of this function will do a database lookup.
-type CacheLoader func(key string) (interface{}, error)
+// Like GetOrLoad, but if there's an error, it will panic. Use this when you know that the cache 
+// loader will never return an error to avoid having to write boilerplate error ignoring code.
+func (this *Cache) GetOrLoadNoErr(key string) interface{} {
+	val, err := this.GetOrLoad(key)
+	if err != nil {
+		panic(err)
+	}
+	return val
+}
 
-// A function that can estimate the size of a cache entry. This is used to enforce the max
-// size of the cache.
-type Sizer func(interface{}) int64
+// Like Combine, but if there's an error, it will panic. Use this when you know that the cache 
+// loader will never return an error to avoid having to write boilerplate error ignoring code.
+func (this *Cache) CombineNoErr(key string, newVal interface{}, combiner Combiner) interface{} {
+	val, err := this.Combine(key, newVal, combiner)
+	if err != nil {
+		panic(err)
+	}
+	return val
+}
+
+// The following are internal private functions.
 
 // These are the elements that go in the FIFO expiration lists.
 type keyValue struct {
 	k     string      // The cache key for this value
 	v     interface{} // The value stored in the cache under this key
-	nanos int64       // The timestamp that this element was last touched.
-	size  int64       // The key length + the size of v, as estimated by the Sizer
+	nanos int64       // The timestamp that this element was created
+	size  int64       // The size of v, as estimated by the Sizer
 }
 
 func newKeyValue(k string, v interface{}, nanos int64, size int64) *keyValue {
@@ -195,13 +287,26 @@ func newKeyValue(k string, v interface{}, nanos int64, size int64) *keyValue {
 	}
 }
 
-// The following are internal private functions.
-
 type stripe struct {
 	lst       *list.List
 	lock      *sync.Mutex
 	totalSize int64
 	elemMap   map[string]*list.Element
+}
+
+// Returns error if the eviction handler returns error. Otherwise returns the size of the
+// removed entry.
+func (this *stripe) remove(elem *list.Element, evictHandler EvictHandler) (int64, error) {
+	kvToRemove := elem.Value.(*keyValue)
+
+	if err := evictHandler(kvToRemove.k, kvToRemove.v); err != nil {
+		return -1, err
+	}
+
+	this.lst.Remove(elem)
+	this.totalSize -= kvToRemove.size
+	delete(this.elemMap, kvToRemove.k)
+	return kvToRemove.size, nil
 }
 
 func newStripe() *stripe {
@@ -215,6 +320,8 @@ func newStripe() *stripe {
 
 func (this *Cache) getStripe(key string) *stripe {
 	hash := crc32.ChecksumIEEE([]byte(key))
+
+	// This will be skewed toward smaller stripe indexes if numstripes does not divide 256.
 	stripeIndex := hash % uint32(this.numStripes)
 
 	// FNV seems to be 2x slower than CRC32. Included for historical reasons but commented out.
