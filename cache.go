@@ -63,6 +63,8 @@ func (this *Cache) GetOrLoad(key string) (interface{}, error) {
 // will cause the Combine() function to have no effect.
 // If there is no value for the given key (the loader returned nil) then the combiner will
 // get a nil as its first parameter.
+// A Combiner can mutate its first argument in place, in which case it should also return that
+// value as its return value.
 type Combiner func(interface{}, interface{}) (interface{}, error)
 
 // Modify a cached value using the given combiner function, holding locks to guarantee
