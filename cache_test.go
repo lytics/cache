@@ -152,7 +152,7 @@ func TestCombine(t *testing.T) {
 	cache := NewCache(16, loadFunc, sizeFunc)
 
 	// A combiner that treats cache entries as ints and combining as addition
-	combiner := func(existing interface{}, newVal interface{}) (interface{}, error) {
+	combiner := func(_ string, existing interface{}, newVal interface{}) (interface{}, error) {
 		if existing == nil {
 			return newVal, nil
 		}
@@ -166,7 +166,7 @@ func TestCombine(t *testing.T) {
 	assert.Equal(t, int64(1), cache.Size())
 
 	// Check that cache entries are successfully removed when the combiner returns nil
-	deleterCombiner := func(existing interface{}, newVal interface{}) (interface{}, error) {
+	deleterCombiner := func(_ string, existing interface{}, newVal interface{}) (interface{}, error) {
 		return nil, nil
 	}
 	assert.Equal(t, nil, cache.CombineNoErr("myKey", 123, deleterCombiner))

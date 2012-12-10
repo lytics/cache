@@ -51,9 +51,10 @@ func NewCache(numStripes int, loader CacheLoader, sizer Sizer) *Cache {
 func (this *Cache) GetOrLoad(key string) (interface{}, error) {
 	// A Get is actually the same thing as a Combine with nothing. The combiner just returns
 	// the loaded value, which will then be stored in the cache.
-	return this.Combine(key, nil, func(loaded interface{}, _ interface{}) (interface{}, error) {
+	combiner := func(_ string, loaded interface{}, _ interface{}) (interface{}, error) {
 		return loaded, nil
-	})
+	}
+	return this.Combine(key, nil, combiner)
 }
 
 // This can be used to modify an existing value held in the cache. You pass a function to be
@@ -63,9 +64,7 @@ func (this *Cache) GetOrLoad(key string) (interface{}, error) {
 // will cause the Combine() function to have no effect.
 // If there is no value for the given key (the loader returned nil) then the combiner will
 // get a nil as its first parameter.
-// A Combiner can mutate its first argument in place, in which case it should also return that
-// value as its return value.
-type Combiner func(interface{}, interface{}) (interface{}, error)
+type Combiner func(key string, oldI interface{}, newI interface{}) (interface{}, error)
 
 // Modify a cached value using the given combiner function, holding locks to guarantee
 // exclusive access. If no value is cached for the given key, the loader will first be invoked 
@@ -93,7 +92,7 @@ func (this *Cache) Combine(key string, newVal interface{}, combiner Combiner) (i
 		existingVal = dbVal
 	}
 
-	combinedVal, err := combiner(existingVal, newVal)
+	combinedVal, err := combiner(key, existingVal, newVal)
 	if err != nil {
 		return nil, err
 	}
@@ -158,11 +157,13 @@ func (this *Cache) Expire(maxSize int64, maxAge time.Duration) map[string]interf
 // If the evict handler encounters an error, then the eviction will stop at that point, so the
 // cache size constraints may not be met until an Expire call succeeds.
 // The eviction handler holds a stripe lock while evicting (by design) so try to make it fast.
+// TODO it would be nice to batch write during eviction
 func (this *Cache) ExpireAndHandle(maxSize int64, maxAge time.Duration,
 	evictHandler EvictHandler) error {
 
 	// TODO running this function with the global lock absolutely destroys throughput. (~8x)
 
+	// TODO can we defer taking the global lock?
 	this.cacheLock.Lock()
 	defer this.cacheLock.Unlock()
 
@@ -190,6 +191,9 @@ func (this *Cache) ExpireAndHandle(maxSize int64, maxAge time.Duration,
 	for _, stripe := range this.stripes {
 		sizeAllStripes += stripe.totalSize
 	}
+
+	// TODO can we improve performance by releasing global lock here and releasing 
+	// currentSize-desiredSize worth of entries?
 
 	// Now remove elements as necessary to enforce the size limit
 	for sizeAllStripes > maxSize {
