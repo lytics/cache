@@ -4,6 +4,7 @@ import (
 	"container/list"
 	// "fmt"
 	"hash/crc32"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -62,6 +63,8 @@ func (this *Cache) GetOrLoad(key string) (interface{}, error) {
 // arguments to the function are (1) the current cache value and (2) an arbitrary value to be
 // combined with it that the caller passes to Combine(). A combiner may return an error, which
 // will cause the Combine() function to have no effect.
+// The return value of the combiner is used as the new cache value. If the combiner returns nil
+// then the cache entry is deleted.
 // If there is no value for the given key (the loader returned nil) then the combiner will
 // get a nil as its first parameter.
 type Combiner func(key string, oldI interface{}, newI interface{}) (interface{}, error)
@@ -98,7 +101,7 @@ func (this *Cache) Combine(key string, newVal interface{}, combiner Combiner) (i
 	}
 
 	// The combiner can return nil to cause the cache entry to be removed.
-	if combinedVal == nil {
+	if isNil(combinedVal) {
 		if hasExisting {
 			delete(stripe.elemMap, key)
 			stripe.totalSize -= elem.Value.(*keyValue).size
@@ -127,6 +130,22 @@ func (this *Cache) Combine(key string, newVal interface{}, combiner Combiner) (i
 	}
 
 	return combinedVal, nil
+}
+
+func isNil(combinedVal interface{}) bool {
+	if combinedVal == nil {
+		return true
+	}
+
+	rv := reflect.ValueOf(combinedVal)
+	switch rv.Kind() {
+	// These are the only nullable kinds. See golang's reflect/value.go
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Ptr, reflect.Interface, reflect.Slice:
+		return rv.IsNil()
+	}
+
+	// The value is not a nullable type, therefore it's valid.
+	return false
 }
 
 // A function that is called when a cache entry is removed from the cache. You might use this to
