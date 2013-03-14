@@ -2,7 +2,6 @@ package cache
 
 import (
 	"container/list"
-	// "fmt"
 	"hash/crc32"
 	"reflect"
 	"sync"
@@ -10,7 +9,8 @@ import (
 )
 
 // A Cache is a concurrent in-memory data structure backed by a database. It internally uses
-// lock striping to try to achieve high throughput when used by many goroutines.
+// lock striping to try to achieve high throughput when used by many goroutines. The cache
+// cannot use nil keys or nil values.
 type Cache struct {
 	stripes    []*stripe
 	numStripes int
@@ -18,7 +18,7 @@ type Cache struct {
 	// maxAge     int64
 	loader    CacheLoader
 	sizer     Sizer
-	cacheLock *sync.RWMutex
+	cacheLock sync.RWMutex
 }
 
 // A function that can look up a key that's not already in the cache. If this function panics
@@ -29,6 +29,12 @@ type CacheLoader func(key string) (interface{}, error)
 // A function that can estimate the size of a cache entry. This is used to enforce the max
 // size of the cache.
 type Sizer func(interface{}) int64
+
+// A convenient sizer function that always returns a size of 1. You can use this for
+// limiting cache size by item count.
+func SizerAlwaysOne(interface{}) int64 {
+	return 1
+}
 
 // Make a new cache.
 //  - numStripes: how many partitions/locks this cache should have. This number should be a
@@ -43,7 +49,6 @@ func NewCache(numStripes int, loader CacheLoader, sizer Sizer) *Cache {
 		numStripes: numStripes,
 		loader:     loader,
 		sizer:      sizer,
-		cacheLock:  new(sync.RWMutex),
 	}
 }
 
@@ -56,6 +61,14 @@ func (this *Cache) GetOrLoad(key string) (interface{}, error) {
 		return loaded, nil
 	}
 	return this.Combine(key, nil, combiner)
+}
+
+// Add an object to the cache manually without running the loader function. Silently
+// overwrites any existing entry with the same key.
+func (this *Cache) Insert(key string, val interface{}) {
+	this.Combine(key, nil, func(string, interface{}, interface{}) (interface{}, error) {
+		return val, nil
+	})
 }
 
 // This can be used to modify an existing value held in the cache. You pass a function to be
@@ -289,6 +302,36 @@ func (this *Cache) CombineNoErr(key string, newVal interface{}, combiner Combine
 		panic(err)
 	}
 	return val
+}
+
+// This is the type of functions that may be passed to Fold(). This function is once for each 
+// item stored in this lru. The value that it returns is passed as an argument to the next
+// invocation of the function, and this value is usually used to gradually accumulate the
+// result of the fold. For instance, a fold operation could calculate the sum of all the
+// integers in an LRU by using a fold func that adds the current element to the running sum
+// stored in the accumulator. The first time the function is called, the accumulator will be
+// nil.
+type FoldFunc func(accumulator interface{}, cacheEntry interface{}) (newAccumulator interface{})
+
+// Apply the given fold function to each entry in the cache. See the FoldFunc docs for more info.
+// Fold can be used to calculate info about all the cache entries such as the max or the sum,
+// copy cache entries, and other things.
+func (this *Cache) Fold(f FoldFunc) interface{} {
+	this.cacheLock.Lock()
+	defer this.cacheLock.Unlock()
+
+	var accum interface{} = nil
+	for _, stripe := range this.stripes {
+		func() { // Wrap the loop body in a function so the deferred unlock gets executed
+			stripe.lock.Lock()
+			defer stripe.lock.Unlock()
+
+			for elem := stripe.lst.Front(); elem != nil; elem = elem.Next() {
+				accum = f(accum, elem.Value.(*keyValue).v)
+			}
+		}()
+	}
+	return accum
 }
 
 // The following are internal private functions.
