@@ -189,6 +189,8 @@ func (this *Cache) Expire(maxSize int64, maxAge time.Duration) map[string]interf
 // If the evict handler encounters an error, then the eviction will stop at that point, so the
 // cache size constraints may not be met until an Expire call succeeds.
 // The eviction handler holds a stripe lock while evicting (by design) so try to make it fast.
+// The stripe lock is held to avoid a race condition where another thread loads the same item
+// that is being flushed to external storage before the flush is committed.
 // TODO it would be nice to batch write during eviction
 func (this *Cache) ExpireAndHandle(maxSize int64, maxAge time.Duration,
 	evictHandler EvictHandler) error {
