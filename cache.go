@@ -83,7 +83,7 @@ func (this *Cache) Insert(key string, val interface{}) {
 type Combiner func(key string, oldI interface{}, newI interface{}) (interface{}, error)
 
 // Modify a cached value using the given combiner function, holding locks to guarantee
-// exclusive access. If no value is cached for the given key, the loader will first be invoked 
+// exclusive access. If no value is cached for the given key, the loader will first be invoked
 // to load a value.
 // Returns the new value of the cache entry, or error if the combiner returned error.
 func (this *Cache) Combine(key string, newVal interface{}, combiner Combiner) (interface{}, error) {
@@ -191,7 +191,6 @@ func (this *Cache) Expire(maxSize int64, maxAge time.Duration) map[string]interf
 // The eviction handler holds a stripe lock while evicting (by design) so try to make it fast.
 // The stripe lock is held to avoid a race condition where another thread loads the same item
 // that is being flushed to external storage before the flush is committed.
-// TODO it would be nice to batch write during eviction
 func (this *Cache) ExpireAndHandle(maxSize int64, maxAge time.Duration,
 	evictHandler EvictHandler) error {
 
@@ -201,7 +200,6 @@ func (this *Cache) ExpireAndHandle(maxSize int64, maxAge time.Duration,
 	this.cacheLock.Lock()
 	defer this.cacheLock.Unlock()
 
-	// returnMap := make(map[string]interface{})
 	expireNanos := time.Now().UnixNano() - int64(maxAge)
 
 	// Now remove all elements older than their expiration time
@@ -226,7 +224,7 @@ func (this *Cache) ExpireAndHandle(maxSize int64, maxAge time.Duration,
 		sizeAllStripes += stripe.totalSize
 	}
 
-	// TODO can we improve performance by releasing global lock here and releasing 
+	// TODO can we improve performance by releasing global lock here and releasing
 	// currentSize-desiredSize worth of entries?
 
 	// Now remove elements as necessary to enforce the size limit
@@ -286,7 +284,7 @@ func (this *Cache) Size() int64 {
 	return totalSize
 }
 
-// Like GetOrLoad, but if there's an error, it will panic. Use this when you know that the cache 
+// Like GetOrLoad, but if there's an error, it will panic. Use this when you know that the cache
 // loader will never return an error to avoid having to write boilerplate error ignoring code.
 func (this *Cache) GetOrLoadNoErr(key string) interface{} {
 	val, err := this.GetOrLoad(key)
@@ -296,7 +294,7 @@ func (this *Cache) GetOrLoadNoErr(key string) interface{} {
 	return val
 }
 
-// Like Combine, but if there's an error, it will panic. Use this when you know that the cache 
+// Like Combine, but if there's an error, it will panic. Use this when you know that the cache
 // loader will never return an error to avoid having to write boilerplate error ignoring code.
 func (this *Cache) CombineNoErr(key string, newVal interface{}, combiner Combiner) interface{} {
 	val, err := this.Combine(key, newVal, combiner)
@@ -306,7 +304,7 @@ func (this *Cache) CombineNoErr(key string, newVal interface{}, combiner Combine
 	return val
 }
 
-// This is the type of functions that may be passed to Fold(). This function is once for each 
+// This is the type of functions that may be passed to Fold(). This function is once for each
 // item stored in this lru. The value that it returns is passed as an argument to the next
 // invocation of the function, and this value is usually used to gradually accumulate the
 // result of the fold. For instance, a fold operation could calculate the sum of all the
