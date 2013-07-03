@@ -238,6 +238,24 @@ func TestEvictAll(t *testing.T) {
 	assert.Equal(t, 5, evictCount)
 }
 
+func TestDelete(t *testing.T) {
+	loadFunc := func(k string) (interface{}, error) {
+		return strconv.Atoi(k)
+	}
+	sizeFunc := func(v interface{}) int64 {
+		return int64(1)
+	}
+	cache := NewCache(16, loadFunc, sizeFunc)
+
+	for i := 0; i < 5; i++ {
+		cache.GetOrLoad(strconv.FormatInt(int64(i), 10))
+	}
+
+	cache.Delete("3")
+	assert.Equal(t, nil, cache.GetNoLoad("3"))
+	assert.T(t, cache.GetNoLoad("2") != nil)
+}
+
 func TestHitAndMiss(t *testing.T) {
 	// Use a loader func that verifies that hits and misses are both happening correctly
 }

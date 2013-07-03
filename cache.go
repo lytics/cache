@@ -60,14 +60,29 @@ func (this *Cache) GetOrLoad(key string) (interface{}, error) {
 	combiner := func(_ string, loaded interface{}, _ interface{}) (interface{}, error) {
 		return loaded, nil
 	}
-	return this.Combine(key, nil, combiner)
+	return this.combine(key, nil, true, combiner)
+}
+
+// Get the value already in the or nil if not present. The loader will not be run.
+func (this *Cache) GetNoLoad(key string) interface{} {
+	combiner := func(_ string, existing interface{}, _ interface{}) (interface{}, error) {
+		return existing, nil
+	}
+	val, _ := this.combine(key, nil, false, combiner)
+	return val
 }
 
 // Add an object to the cache manually without running the loader function. Silently
 // overwrites any existing entry with the same key.
 func (this *Cache) Insert(key string, val interface{}) {
-	this.Combine(key, nil, func(string, interface{}, interface{}) (interface{}, error) {
+	this.combine(key, nil, false, func(string, interface{}, interface{}) (interface{}, error) {
 		return val, nil
+	})
+}
+
+func (this *Cache) Delete(key string) {
+	this.combine(key, nil, false, func(string, interface{}, interface{}) (interface{}, error) {
+		return nil, nil
 	})
 }
 
@@ -87,6 +102,12 @@ type Combiner func(key string, oldI interface{}, newI interface{}) (interface{},
 // to load a value.
 // Returns the new value of the cache entry, or error if the combiner returned error.
 func (this *Cache) Combine(key string, newVal interface{}, combiner Combiner) (interface{}, error) {
+	return this.combine(key, newVal, true, combiner)
+}
+
+func (this *Cache) combine(key string, newVal interface{}, loadIfNot bool, combiner Combiner) (
+	interface{}, error) {
+
 	this.cacheLock.RLock() // Mutual exclusion against threads computing cache expiration
 	defer this.cacheLock.RUnlock()
 
@@ -100,7 +121,7 @@ func (this *Cache) Combine(key string, newVal interface{}, combiner Combiner) (i
 	elem, hasExisting := stripe.elemMap[key]
 	if hasExisting {
 		existingVal = elem.Value.(*keyValue).v
-	} else {
+	} else if loadIfNot {
 		dbVal, err := this.loader(key)
 		if err != nil {
 			return nil, err
