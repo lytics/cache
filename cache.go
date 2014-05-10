@@ -5,6 +5,7 @@ import (
 	"hash/crc32"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,9 +17,10 @@ type Cache struct {
 	numStripes int
 	// maxSize    int64
 	// maxAge     int64
-	loader    CacheLoader
-	sizer     Sizer
-	cacheLock sync.RWMutex
+	loader     CacheLoader
+	sizer      Sizer
+	cacheLock  sync.RWMutex
+	approxSize int64
 }
 
 // A function that can look up a key that's not already in the cache. If this function panics
@@ -138,8 +140,10 @@ func (this *Cache) combine(key string, newVal interface{}, loadIfNot bool, combi
 	if isNil(combinedVal) {
 		if hasExisting {
 			delete(stripe.elemMap, key)
-			stripe.totalSize -= elem.Value.(*keyValue).size
+			elemSize := elem.Value.(*keyValue).size
+			stripe.totalSize -= elemSize
 			stripe.lst.Remove(elem)
+			atomic.AddInt64(&this.approxSize, -1*elemSize)
 		}
 	} else {
 		// The value returned from the combiner was not null.
@@ -149,8 +153,9 @@ func (this *Cache) combine(key string, newVal interface{}, loadIfNot bool, combi
 			// Update preexisting entry.
 			keyValue := elem.Value.(*keyValue)
 
-			stripe.totalSize -= keyValue.size
-			stripe.totalSize += newSize
+			sizeDiff := newSize - keyValue.size
+			stripe.totalSize += sizeDiff
+			atomic.AddInt64(&this.approxSize, sizeDiff)
 
 			keyValue.v = combinedVal
 			keyValue.size = newSize
@@ -158,6 +163,7 @@ func (this *Cache) combine(key string, newVal interface{}, loadIfNot bool, combi
 			// The entry did not previously exist. Store it in the cache now.
 			keyValue := newKeyValue(key, combinedVal, time.Now().UnixNano(), newSize)
 			stripe.totalSize += newSize
+			atomic.AddInt64(&this.approxSize, newSize)
 			newElem := stripe.lst.PushBack(keyValue)
 			stripe.elemMap[key] = newElem
 		}
@@ -233,8 +239,10 @@ func (this *Cache) ExpireAndHandle(maxSize int64, maxAge time.Duration,
 			}
 			elemToDelete := elem
 			elem = elem.Next()
-			if _, err := stripe.remove(elemToDelete, evictHandler); err != nil {
+			if sizeRemoved, err := stripe.remove(elemToDelete, evictHandler); err != nil {
 				return err
+			} else {
+				atomic.AddInt64(&this.approxSize, -1*sizeRemoved)
 			}
 		}
 	}
@@ -278,6 +286,7 @@ func (this *Cache) ExpireAndHandle(maxSize int64, maxAge time.Duration,
 			return err
 		}
 		sizeAllStripes -= sizeRemoved
+		atomic.AddInt64(&this.approxSize, -1*sizeRemoved)
 	}
 
 	return nil
@@ -291,7 +300,6 @@ func (this *Cache) EvictAll(evictHandler EvictHandler) error {
 
 // Returns the sum of all the sizes of all the cache entries plus the lengths of the cache keys.
 // The "size" of a cache entry is defined to be the value returned by the sizer for that entry.
-// TODO should we offer a fast inconsistent approximate Size() that avoids taking the big lock?
 func (this *Cache) Size() int64 {
 	this.cacheLock.Lock()
 	defer this.cacheLock.Unlock()
@@ -303,6 +311,12 @@ func (this *Cache) Size() int64 {
 		stripe.lock.Unlock()
 	}
 	return totalSize
+}
+
+// Gets the approximate size of the cache. This is approximate because no locks are taken, so the
+// cache may be concurrently modified.
+func (this *Cache) ApproxSize() int64 {
+	return atomic.LoadInt64(&this.approxSize)
 }
 
 // Like GetOrLoad, but if there's an error, it will panic. Use this when you know that the cache
