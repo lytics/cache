@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"sync"
 	// "fmt"
 	"github.com/bmizerany/assert"
 	"strconv"
@@ -254,6 +255,43 @@ func TestDelete(t *testing.T) {
 	cache.Delete("3")
 	assert.Equal(t, nil, cache.GetNoLoad("3"))
 	assert.T(t, cache.GetNoLoad("2") != nil)
+}
+
+// For maximum testitude run this test with env var GOMAXPROCS greater than 1, to get parallel execution.
+func TestCacheSize(t *testing.T) {
+	loadFunc := func(k string) (interface{}, error) {
+		return strconv.Atoi(k)
+	}
+	sizeFunc := func(v interface{}) int64 {
+		return int64(v.(int))
+	}
+	cache := NewCache(16, loadFunc, sizeFunc)
+
+	// Churn the cache from many goroutines
+	const numGoRoutines = 10
+	const iterationsPerGoRt = 100000
+	var startWg, stopWg sync.WaitGroup
+	startWg.Add(numGoRoutines)
+	stopWg.Add(numGoRoutines)
+	for i := 0; i < numGoRoutines; i++ {
+		numToGet := strconv.Itoa(i)
+		go func() {
+			startWg.Done()
+			startWg.Wait() // Wait for all goroutines to get started before generating load
+			for iter := 0; iter < iterationsPerGoRt; iter++ {
+				cache.GetOrLoadNoErr(numToGet)
+				cache.Delete(numToGet)
+			}
+			stopWg.Done() // signal that this worker is done
+		}()
+	}
+
+	stopWg.Wait() // wait for all workers to finish
+	assert.Equal(t, int64(0), cache.Size())
+	assert.Equal(t, int64(0), cache.ApproxSize())
+	for _, stripe := range cache.stripes {
+		assert.Equal(t, stripe.totalSize, int64(0))
+	}
 }
 
 func TestHitAndMiss(t *testing.T) {
