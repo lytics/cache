@@ -313,6 +313,20 @@ func (this *Cache) Size() int64 {
 	return totalSize
 }
 
+// Returns the number of entries in the cache
+func (this *Cache) Len() int64 {
+	this.cacheLock.Lock()
+	defer this.cacheLock.Unlock()
+
+	totalSize := int64(0)
+	for _, stripe := range this.stripes {
+		stripe.lock.Lock()
+		totalSize += int64(len(stripe.elemMap))
+		stripe.lock.Unlock()
+	}
+	return totalSize
+}
+
 // Gets the approximate size of the cache. This is approximate because no locks are taken, so the
 // cache may be concurrently modified.
 func (this *Cache) ApproxSize() int64 {
